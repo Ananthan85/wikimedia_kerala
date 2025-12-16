@@ -1,169 +1,214 @@
 #wikimedia_scraper.py
 #import necessary libraries
 # wikimedians_scraper.py
-import os
-import re
 import requests
 from bs4 import BeautifulSoup
-from markdownify import markdownify as md
+import markdownify
 from slugify import slugify
+import os
+import re
 
-BASE_URL = "https://meta.wikimedia.org"
-EVENTS_INDEX_URL = "https://meta.wikimedia.org/wiki/Wikimedians_of_Kerala/Activities/Events"
-CONTENT_DIR = "content/events"
-STATIC_IMG_DIR = "static/images/events"
+# Main events page
+EVENTS_PAGE = "https://meta.wikimedia.org/wiki/Wikimedians_of_Kerala/Activities/Events"
+WIKI_BASE = "https://meta.wikimedia.org"
 
-os.makedirs(CONTENT_DIR, exist_ok=True)
-os.makedirs(STATIC_IMG_DIR, exist_ok=True)
+def fetch_page(url):
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; EventScraper/1.0)'}
+    response = requests.get(url, headers=headers)
+    return BeautifulSoup(response.content, 'html.parser')
 
+def extract_events(soup):
+    """Extract event links and titles from main page"""
+    events = []
+    # Target tables and links - adjust selectors based on actual structure
+    links = soup.find_all('a', href=re.compile(r'/wiki/Wikimedians_of_Kerala/Events/'))
+    for link in links:
+        title = link.get_text().strip()
+        href = link.get('href')
+        if title and href:
+            events.append({
+                'title': title,
+                'url': WIKI_BASE + href if href.startswith('/') else href
+            })
+    return events
 
-def clean_title(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+def convert_html_to_md(soup, base_url):
+    """Convert full page HTML to clean Markdown"""
+    # Clean up wiki-specific elements
+    for elem in soup(['sup', 'span.editsection']):
+        elem.decompose()
+    
+    md_content = markdownify.markdownify(str(soup), heading_style="ATX")
+    return md_content.strip()
 
-
-def fetch_html(url: str) -> BeautifulSoup:
-    resp = requests.get(url)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "lxml")
-
-
-def extract_event_links() -> list:
-    """
-    From the events index page, collect links to individual event pages.
-    Adjust selectors if Meta changes layout.
-    """
-    soup = fetch_html(EVENTS_INDEX_URL)
-    links = []
-
-    # Typical pattern on Meta: lists of links under content div
-    content_div = soup.find("div", {"id": "mw-content-text"})
-    if not content_div:
-        return links
-
-    for a in content_div.select("a[href]"):
-        href = a["href"]
-        title = a.get_text(strip=True)
-        # Filter only event pages under Wikimedians_of_Kerala/Events
-        if (
-            href.startswith("/wiki/Wikimedians_of_Kerala/Events")
-            or href.startswith("/wiki/Event:Wikimedians_of_Kerala")
-        ):
-            full_url = BASE_URL + href
-            links.append((clean_title(title), full_url))
-
-    # Deduplicate by URL
-    seen = set()
-    unique = []
-    for title, url in links:
-        if url not in seen:
-            seen.add(url)
-            unique.append((title, url))
-    return unique
-
-
-def download_image(img_url: str, event_slug: str, idx: int) -> str:
-    if img_url.startswith("//"):
-        img_url = "https:" + img_url
-    elif img_url.startswith("/"):
-        img_url = BASE_URL + img_url
-
-    ext = os.path.splitext(img_url.split("?")[0])[1] or ".jpg"
-    filename = f"{event_slug}-{idx}{ext}"
-    local_path = os.path.join(STATIC_IMG_DIR, filename)
-
-    try:
-        r = requests.get(img_url, stream=True, timeout=20)
-        r.raise_for_status()
-        with open(local_path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                f.write(chunk)
-        # Hugo static path (without 'static/')
-        return f"/images/events/{filename}"
-    except Exception as e:
-        print(f"[img-error] {img_url} -> {e}")
-        return ""
-
-
-def extract_event_page(title: str, url: str):
-    soup = fetch_html(url)
-
-    # Get the title from page if available
-    h1 = soup.find("h1", id="firstHeading")
-    page_title = clean_title(h1.get_text()) if h1 else title
-
-    # Main content area
-    content_div = soup.find("div", {"id": "mw-content-text"})
-    if not content_div:
-        html_content = ""
-    else:
-        # Clone to avoid mutating soup
-        content_clone = BeautifulSoup(str(content_div), "lxml")
-
-        # Strip irrelevant elements (edit sections, TOC, nav boxes)
-        for el in content_clone.select(".mw-editsection, #toc, .navbox, .metadata"):
-            el.decompose()
-
-        html_content = str(content_clone)
-
+def scrape_event_details(event):
+    """Fetch and convert individual event page"""
+    print(f"Processing: {event['title']}")
+    soup = fetch_page(event['url'])
+    
+    # Extract main content (usually #mw-content-text)
+    content = soup.find('div', {'id': 'mw-content-text'})
+    if not content:
+        content = soup.find('div', class_='mw-parser-output')
+    
+    md_content = convert_html_to_md(content, event['url'])
+    
     # Extract images
     images = []
-    if content_div:
-        for idx, img in enumerate(content_div.select("img"), start=1):
-            src = img.get("src")
-            if not src:
-                continue
-            local_url = download_image(src, slugify(page_title)[:40], idx)
-            if local_url:
-                images.append(local_url)
+    for img in content.find_all('img'):
+        src = img.get('src')
+        if src and ('commons.wikimedia.org' in src or 'upload.wikimedia.org' in src):
+            images.append(src)
+    
+    return {
+        'title': event['title'],
+        'slug': slugify(event['title']),
+        'content': md_content,
+        'images': images,
+        'url': event['url']
+    }
 
-    # Convert HTML to Markdown
-    body_md = md(html_content, heading_style="ATX")
+def generate_hugo_pages(events_data, output_dir="content/events"):
+    """Generate Hugo Markdown frontmatter pages"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for event in events_data:
+        slug = event['slug']
+        filename = os.path.join(output_dir, f"{slug}.md")
+        
+        frontmatter = f"""---
+title: "{event['title']}"
+date: {pd.Timestamp.now().isoformat()}
+url: "{event['url']}"
+images:
+"""
+        for img in event['images']:
+            frontmatter += f"  - {img}\n"
+        frontmatter += "---\n\n"
+        
+        content = frontmatter + event['content']
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"Generated: {filename}")
 
-    return page_title, body_md, images
-
-
-def write_markdown_file(title: str, body_md: str, images: list, source_url: str):
-    slug = slugify(title) or "event"
-    filename = os.path.join(CONTENT_DIR, f"{slug}.md")
-
-    front_matter = [
-        "+++",
-        f'title = "{title.replace(\'"\', "\\\"")}"',
-        f'slug = "{slug}"',
-        f'url = "/events/{slug}/"',
-        f'source = "{source_url}"',
-    ]
-    if images:
-        front_matter.append("images = [")
-        for img in images:
-            front_matter.append(f'  "{img}",')
-        front_matter.append("]")
-    front_matter.append("+++")
-    front_matter_str = "\n".join(front_matter)
-
-    # Optional header in content
-    content = f"{front_matter_str}\n\n{body_md}\n"
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(content)
-
-    print(f"[ok] {filename}")
-
-
-def main():
-    events = extract_event_links()
-    print(f"Found {len(events)} event links")
-    for title, url in events:
-        try:
-            print(f"[event] {title} -> {url}")
-            page_title, body_md, images = extract_event_page(title, url)
-            write_markdown_file(page_title, body_md, images, url)
-        except Exception as e:
-            print(f"[error] {title} ({url}): {e}")
-
-
+# Main execution
 if __name__ == "__main__":
-    main()
+    print("Fetching main events page...")
+    main_soup = fetch_page(EVENTS_PAGE)
+    
+    events = extract_events(main_soup)
+    print(f"Found {len(events)} events")
+    
+    events_data = []
+    for event in events[:10]:  # Limit for testing
+        events_data.append(scrape_event_details(event))
+    
+    generate_hugo_pages(events_data)
+    print("Hugo pages generated in content/events/")
+import requests
+from bs4 import BeautifulSoup
+import markdownify
+from slugify import slugify
+import os
+import re
+
+# Main events page
+EVENTS_PAGE = "https://meta.wikimedia.org/wiki/Wikimedians_of_Kerala/Activities/Events"
+WIKI_BASE = "https://meta.wikimedia.org"
+
+def fetch_page(url):
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; EventScraper/1.0)'}
+    response = requests.get(url, headers=headers)
+    return BeautifulSoup(response.content, 'html.parser')
+
+def extract_events(soup):
+    """Extract event links and titles from main page"""
+    events = []
+    # Target tables and links - adjust selectors based on actual structure
+    links = soup.find_all('a', href=re.compile(r'/wiki/Wikimedians_of_Kerala/Events/'))
+    for link in links:
+        title = link.get_text().strip()
+        href = link.get('href')
+        if title and href:
+            events.append({
+                'title': title,
+                'url': WIKI_BASE + href if href.startswith('/') else href
+            })
+    return events
+
+def convert_html_to_md(soup, base_url):
+    """Convert full page HTML to clean Markdown"""
+    # Clean up wiki-specific elements
+    for elem in soup(['sup', 'span.editsection']):
+        elem.decompose()
+    
+    md_content = markdownify.markdownify(str(soup), heading_style="ATX")
+    return md_content.strip()
+
+def scrape_event_details(event):
+    """Fetch and convert individual event page"""
+    print(f"Processing: {event['title']}")
+    soup = fetch_page(event['url'])
+    
+    # Extract main content (usually #mw-content-text)
+    content = soup.find('div', {'id': 'mw-content-text'})
+    if not content:
+        content = soup.find('div', class_='mw-parser-output')
+    
+    md_content = convert_html_to_md(content, event['url'])
+    
+    # Extract images
+    images = []
+    for img in content.find_all('img'):
+        src = img.get('src')
+        if src and ('commons.wikimedia.org' in src or 'upload.wikimedia.org' in src):
+            images.append(src)
+    
+    return {
+        'title': event['title'],
+        'slug': slugify(event['title']),
+        'content': md_content,
+        'images': images,
+        'url': event['url']
+    }
+
+def generate_hugo_pages(events_data, output_dir="content/events"):
+    """Generate Hugo Markdown frontmatter pages"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for event in events_data:
+        slug = event['slug']
+        filename = os.path.join(output_dir, f"{slug}.md")
+        
+        frontmatter = f"""---
+title: "{event['title']}"
+date: {pd.Timestamp.now().isoformat()}
+url: "{event['url']}"
+images:
+"""
+        for img in event['images']:
+            frontmatter += f"  - {img}\n"
+        frontmatter += "---\n\n"
+        
+        content = frontmatter + event['content']
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(content)
+        print(f"Generated: {filename}")
+
+# Main execution
+if __name__ == "__main__":
+    print("Fetching main events page...")
+    main_soup = fetch_page(EVENTS_PAGE)
+    
+    events = extract_events(main_soup)
+    print(f"Found {len(events)} events")
+    
+    events_data = []
+    for event in events[:10]:  # Limit for testing
+        events_data.append(scrape_event_details(event))
+    
+    generate_hugo_pages(events_data)
+    print("Hugo pages generated in content/events/")
 
 
 
